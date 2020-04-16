@@ -1,0 +1,383 @@
+#!/usr/bin/env php
+<?php
+// Configuration and parameters
+const DEFAULT_CSV_DELIMITER = ",";
+const PROTECTED_DELIMITER_CHARS = ["-", "_", "\"", "'", "\\"];
+const JSON_ENCODE_OPTIONS = JSON_THROW_ON_ERROR;
+
+// Errors - displayed on stderr
+const ERR_UNKNOWN = 1;
+const ERR_OPTIONS = 3;
+const ERR_READING_CSV = 5;
+const ERR_CSV_FORMAT = 7;
+
+// Setup a simple error handler to convert every php errors into exception
+// This is a security to not miss any warnings or notices (or whatever that is not en exception) that will not trigger an error exit code
+set_error_handler(function (int $errno, string $errmsg, string $errfile, string $errline): bool {
+    throw new ErrorException($errmsg, 0, $errno, $errfile, $errline);
+});
+
+// If this constant is defined, it tells this script to not go further, and avoid the execution of main()
+// This trick is used to include this script without executing it (we just need the functions declarations), mainly for the unit tests
+if (defined('CSV2JSON_NO_EXECUTE')) {
+    return;
+}
+
+// This try/catch is the whole command starting point, the remaining code is just functions
+try {
+    main($argv);
+    exit(0); // Success
+} catch (\Throwable $error) {
+    fwrite(STDERR, 'ERROR: ' . $error->getMessage() . PHP_EOL);
+    // Error with zero code means that is a not handled exception, and must display more details
+    if (0 === $error->getCode()) {
+        fwrite(STDERR, $error->getTraceAsString() . PHP_EOL);
+    }
+
+    exit($error->getCode() ?: ERR_UNKNOWN);
+}
+
+function main(array $argv): void {
+    $options = getOptions($argv);
+
+    if ($options['help']) {
+        fwrite(STDOUT, help());
+        return;
+    }
+
+    if (null === $options['csv_file']) {
+        throw new Exception('A csv file is required or provide csv via stdin', ERR_OPTIONS);
+    }
+
+    $csvHandle = unlessError(fn() => fopen($options['csv_file'], 'r'), sprintf('Reading "%s"', $options['csv_file']), ERR_READING_CSV);
+
+    $lines = parseCsv($csvHandle, $options['ignore_error']);
+
+    if ($options['fields']) {
+        $lines = filterFields($lines, ...$options['fields']);
+    }
+
+    if ($options['fields_map']) {
+        $lines = formatFields($lines, $options['fields_map'], $options['ignore_error']);
+    }
+
+    if ($options['aggregate']) {
+        $lines = aggregate($lines, $options['aggregate']);
+    }
+
+    $jsonOptions = JSON_ENCODE_OPTIONS;
+    if ($options['pretty']) {
+        $lines = is_array($lines) ? $lines : iterator_to_array($lines);
+        $jsonOptions |= JSON_PRETTY_PRINT;
+    }
+
+    if (is_array($lines)) {
+        fwrite(STDOUT, json_encode($lines, $jsonOptions));
+        return;
+    }
+
+    streamJson(STDOUT, $lines);
+}
+
+/**
+ * Retrieve and prepare options and argument from cli
+ */
+function getOptions(array $argv): array {
+    $options = [];
+    $opt = getopt('h', ['fields:', 'aggregate:', 'desc:', 'pretty', 'ignore'], $optind);
+
+    $options['help'] = isset($opt['h']);
+
+    $options['csv_file'] = array_slice($argv, $optind, 1)[0] ?? null;
+    // Using - as a filename to mean stdin/stdout is a convention that a lot of programs use
+    // This is a shortcut to typing /dev/stdin, but we convert it into php://stdin to keep portability
+    $options['csv_file'] = '-' === $options['csv_file'] ? 'php://stdin' : $options['csv_file'];
+
+    $options['aggregate'] = $opt['aggregate'] ?? null;
+
+    $options['fields'] = isset($opt['fields']) ? str_getcsv($opt['fields'], getDelimiter($opt['fields'])) : null;
+    // If an aggregate field is provided, we must add it to the wanted fields before, in case the aggregate field was filtered
+    if ($options['fields'] && $options['aggregate']) {
+        $options['fields'][] = $options['aggregate'];
+    }
+
+    $options['pretty'] = isset($opt['pretty']);
+
+    $options['ignore_error'] = isset($opt['ignore']);
+
+    $options['fields_map'] = null;
+    if (isset($opt['desc'])) {
+        $desc = unlessError(fn() => file_get_contents($opt['desc']), sprintf('Reading description file "%s"', $opt['desc']), ERR_OPTIONS);
+
+        $options['fields_map'] = createFieldsMapFromDescription($desc);
+    }
+
+    return $options;
+}
+
+/**
+ * Create a convenient array of fields description from the content of the description file
+ */
+function createFieldsMapFromDescription(string $desc): array {
+    // Remove comments from the fields description, parse_ini_string leaves comments that are on the same line as a key=value
+    // because in INI format the comment char is semicolon ;
+    $desc = trim(preg_replace('/(#.*)/', '', $desc));
+    $fieldsType = unlessError(fn() => parse_ini_string($desc), 'Malformed description file', ERR_OPTIONS);
+
+    // Remove empty fields, ex: field1=
+    $fieldsType = array_filter($fieldsType);
+
+    return array_map(function (string $type): array {
+        $nullable = '?' === substr($type, 0, 1);
+        return [$nullable ? substr($type, 1) : $type, $nullable];
+    }, $fieldsType);
+}
+
+/**
+ * Format fields following the description file, use all format<Type>() functions inside
+ */
+function formatFields(iterable $lines, array $fieldsMap, bool $ignoreError = false): Generator {
+    $formatters = [
+        'int' => fn($v) => formatInt($v),
+        'integer' => fn($v) => formatInt($v),
+        'float' => fn($v) => formatFloat($v),
+        'bool' => fn($v) => formatBool($v),
+        'boolean' => fn($v) => formatBool($v),
+        'date' => fn($v) => formatDatetime($v, 'Y-m-d'),
+        'time' => fn($v) => formatDatetime($v, 'H:i:s'),
+        'datetime' => fn($v) => formatDatetime($v, 'Y-m-d H:i:s'),
+        'string' => fn($v) => $v,
+    ];
+
+    foreach ($lines as $lineNumber => $line) {
+        foreach ($fieldsMap as $field => [$type, $nullable]) {
+            // If the field is not found in line we skip formatting and continue
+            if (!array_key_exists($field, $line)) {
+                continue;
+            }
+
+            $value = &$line[$field];
+
+            if ('' === $value && $nullable) {
+                $value = null;
+                continue;
+            }
+
+            try {
+                if (!$formatter = $formatters[$type] ?? false) {
+                    throw new Exception(sprintf('Unknown type "%s"', $type));
+                }
+
+                $value = $formatter($value);
+            } catch (Exception $e) {
+                if (!$ignoreError) {
+                    throw new Exception(sprintf(
+                        'Unable to format field "%s" with value "%s" into %s on line %d: %s',
+                        $field,
+                        $value,
+                        $type,
+                        $lineNumber,
+                        $e->getMessage(),
+                    ), ERR_CSV_FORMAT);
+                }
+
+                $value = null;
+            }
+        }
+
+        yield $lineNumber => $line;
+    }
+}
+
+function formatFloat(string $value): float {
+    // Try to clean the value before to help formatting, ex: 1 000 000,20 => 1000000.20
+    $value = strtr($value, [' ' => '', ',' => '.']);
+
+    if (!is_numeric($value)) {
+        throw new Exception('Value is not numeric');
+    }
+
+    return (float) $value;
+}
+
+function formatInt(string $value): int {
+    return (int) formatFloat($value);
+}
+
+function formatBool(string $value): bool {
+    switch (strtolower($value)) {
+        case '0':
+        case 'no':
+        case 'off':
+        case 'false':
+            return false;
+            break;
+        case '1':
+        case 'yes':
+        case 'on':
+        case 'true':
+            return true;
+            break;
+        default:
+            throw new Exception('Not a boolean value');
+            break;
+    }
+}
+
+function formatDatetime(string $value, string $format): string {
+    if (false === Datetime::createFromFormat($format, $value)) {
+        throw new Exception('Value doesn\'t match the format ' . $format);
+    }
+
+    return $value;
+}
+
+/**
+ * Aggregates lines on a specific field, works like a buffer and ruin the whole chain of generator, but hey
+ */
+function aggregate(iterable $lines, string $field): array {
+    $aggregate = [];
+
+    foreach ($lines as $line) {
+        if (!array_key_exists($field, $line)) {
+            throw new Exception(sprintf('Aggregate field "%s" doesn\'t exist', $field), ERR_OPTIONS);
+        }
+
+        // filter the aggregate field from the line
+        $aggregate[$line[$field]][] = array_filter($line, fn($key) => $key !== $field, ARRAY_FILTER_USE_KEY);
+    }
+
+    return $aggregate;
+}
+
+/**
+ * Only keep wanted $fields on each lines
+ */
+function filterFields(iterable $lines, string ...$fields): Generator {
+    foreach ($lines as $lineNumber => $line) {
+        yield $lineNumber => array_filter($line, fn($key) => in_array($key, $fields, true), ARRAY_FILTER_USE_KEY);
+    }
+}
+
+/**
+ * Try to guess the CSV delimiter in a one line csv string (because we want also use this function for the --fields option)
+ * As far as I can see, there is no sure way to detect a delimiter with such little hints
+ */
+function getDelimiter(string $str): string {
+    // We gather all unique chars from the string as an array
+    $delimiters = array_unique(str_split($str));
+    // Remove some chars protected as non delimiter
+    $delimiters = array_filter($delimiters, function (string $delimiter): bool {
+        return '' !== $delimiter && !preg_match('/\w/', $delimiter) && !in_array($delimiter, PROTECTED_DELIMITER_CHARS, true);
+    });
+
+    if (0 === count($delimiters)) {
+        return DEFAULT_CSV_DELIMITER;
+    }
+
+    $delimiters = array_fill_keys($delimiters, 0);
+
+    // We parse csv for each potential delimiter and assume the delimiter that produce more cells is the good one
+    foreach ($delimiters as $delimiter => &$count) {
+        $count = count(str_getcsv($str, $delimiter));
+    }
+
+    return array_search(max($delimiters), $delimiters);
+}
+
+/**
+ * Starting point generator, parse each line of the csv and yield an associative array with headers as keys
+ */
+function parseCsv($handle, bool $ignoreError = false): Generator {
+    $headerLine = unlessError(fn() => fgets($handle), 'Reading CSV headers', ERR_READING_CSV);
+    $delimiter = getDelimiter($headerLine);
+    $headers = array_map('trim', str_getcsv($headerLine, $delimiter));
+    $nbHeaders = count($headers);
+    $lineNumber = 1; // We count the header line
+
+    try {
+        while (false !== $line = fgetcsv($handle, 0, $delimiter)) {
+            $lineNumber++;
+
+            // Skip empty lines
+            if ([null] === $line) {
+                continue;
+            }
+
+            if ($nbHeaders !== $nbColumns = count($line)) {
+                if (!$ignoreError) {
+                    throw new Exception(sprintf(
+                        "Line %d should be %d long cells instead of %d\nLine %d:\n%s",
+                        $lineNumber,
+                        $nbHeaders,
+                        $nbColumns,
+                        $lineNumber,
+                        implode($delimiter, $line),
+                    ), ERR_CSV_FORMAT);
+                }
+
+                // Cut the end if the line is too long or fill the end with empty string if too short
+                $line = $nbHeaders < $nbColumns ? array_slice($line, 0, $nbHeaders) : array_pad($line, $nbHeaders, '');
+            }
+
+            yield $lineNumber => array_combine($headers, $line);
+        }
+    } catch (ErrorException $error) {
+        throw new Exception(
+            sprintf('Reading CSV line %d: %s', $lineNumber + 1, $error->getMessage()),
+            ERR_READING_CSV
+        );
+    }
+}
+
+/**
+ * Write JSON in a streaming way
+ */
+function streamJson($handle, Generator $lines): void {
+    fwrite($handle, '[');
+
+    $seperator = '';
+
+    foreach ($lines as $line) {
+        fwrite($handle, $seperator . json_encode($line, JSON_ENCODE_OPTIONS));
+        $seperator = ',';
+    }
+
+    fwrite($handle, ']');
+}
+
+/**
+ * Allow us to decorate an exception with a message prefix and a custom code
+ */
+function unlessError(callable $callable, string $message, int $code) {
+    try {
+        return call_user_func($callable);
+    } catch (\Throwable $error) {
+        $message = $message ? $message . ': ' : '';
+        $message .= $error->getMessage();
+
+        throw new Exception($message, $code, $error);
+    }
+}
+
+function help(): string {
+    return <<<HELP
+    Command-line tool to convert CSV to JSON
+
+    Usage: csv2json [options] <csv_file>
+    
+    Examples:
+        csv2json myfile.csv > result.json
+        echo "id;name\\n1;bob" | csv2json -
+    
+    Available options:
+      -h                              Show this help text
+      --fields "<field1,field2,...>"  List of field (based on headers) to include in the json. All by default
+      --aggregate <field>             Aggregate lines on the selected field
+      --desc <file>                   Description file of fields types. INI format: field1=?bool (Optional ? before the type to convert empty cell in null)
+                                      Supported formats: string, float, int, bool, date, time, datetime
+      --pretty                        Print human readable json
+      --ignore                        Ignore errors of inconsistent line size or format, useful for trashy CSV
+
+    HELP;
+}

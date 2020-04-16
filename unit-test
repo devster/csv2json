@@ -1,0 +1,253 @@
+#!/usr/bin/env php
+<?php
+
+// Little trick to include the file without executing it, see how it is used in csv2json
+// ob_* function is another trick to avoid the display of the csv2json shebang :D
+// Yes. I know.
+const CSV2JSON_NO_EXECUTE = true;
+ob_start(); include __DIR__ . '/csv2json'; ob_end_clean();
+
+// Test suite
+
+test('e2e csv2json reading from stdin', function () {
+    [$code, $stdout, $stderr] = execCommand(['-'], [
+        'id;name',
+        '1;bob',
+        '2;john',
+    ]);
+
+    assertEqual(0, $code);
+    assertEqual('[{"id":"1","name":"bob"},{"id":"2","name":"john"}]', $stdout);
+    assertEqual('', $stderr);
+});
+
+test('e2e missing file argument', function () {
+    [$code, $stdout, $stderr] = execCommand([]);
+
+    assertEqual(ERR_OPTIONS, $code);
+    assertEqual('', $stdout);
+    assertEqual('ERROR: A csv file is required or provide csv via stdin', $stderr);
+});
+
+test('e2e full options :)', function () {
+    $csvFile = tempnam(sys_get_temp_dir(), 'csv');
+    // Last cell of john's line missing, to test --ignore and nullable field
+    file_put_contents($csvFile, <<<CSV
+    id,nick,name,age,enabled
+    1,jojo,john,27
+    2,jaja,jane,27,yes
+    CSV);
+
+    $descFile = tempnam(sys_get_temp_dir(), 'desc');
+    file_put_contents($descFile, <<<DESC
+    id=int
+    name = string
+    age = int
+    enabled = ?boolean
+    DESC);
+
+    [$code, $stdout, $stderr] = execCommand(['--desc', $descFile, '--fields', 'id|name|enabled', '--aggregate', 'age', '--ignore', $csvFile]);
+
+    assertEqual(0, $code);
+    assertEqual('{"27":[{"id":1,"name":"john","enabled":null},{"id":2,"name":"jane","enabled":true}]}', $stdout);
+    assertEqual('', $stderr);
+
+    unlink($csvFile);
+    unlink($descFile);
+});
+
+test('getDelimiter', function (string $csvLine, string $expectedDelimiter) {
+    assertEqual($expectedDelimiter, getDelimiter($csvLine));
+}, fn() => [
+    ['onecolumn', DEFAULT_CSV_DELIMITER],
+    ['id name age', ' '],
+    ['id;first name;age', ';'],
+    ['id;"Hello there, wazzup?";age', ';'],
+    ['id^name,age', '^'],
+    ['id^name,age,date', ','],
+    ['id|what-is-this-field-uh?|age', '|'], // '-' is protected
+    ['id;",,,";age', ','], // not what we want :(
+    ['id;"here again not what we want";age', ' '], // not what we want :(
+]);
+
+test('createFieldsMapFromDescription', function () {
+    $desc = <<<DESC
+    ### Ceci est un commentaire.
+    # les lignes vide ne sont pas utilisées
+    
+    name = string  # oui, il peut y avoir des espaces de chaque coté du "="
+    id=?int
+    date=datetime
+    field=
+    DESC;
+
+    $expected = [
+        'name' => ['string', false],
+        'id' => ['int', true],
+        'date' => ['datetime', false],
+    ];
+
+    assertEqual($expected, createFieldsMapFromDescription($desc));
+
+    assertException(new Exception('/Malformed description file/', ERR_OPTIONS), function() {
+        createFieldsMapFromDescription(" = oups bad ini");
+    });
+});
+
+test('formatFloat', function (string $value, $expected) {
+    assertEqual($expected, formatFloat($value));
+}, fn() => [
+    ['42', 42.0],
+    [' 42. 42 ', 42.42],
+    ['1 000,85', 1000.85],
+]);
+
+test('formatFloat bad format', function (string $value) {
+    assertException(new Exception('/not numeric/'), fn() => formatFloat($value));
+}, fn() => [
+    ['oups'],
+    ['1,000,000.15'],
+    [''],
+]);
+
+// Test suite internals
+
+/**
+ * Portable way to "exec()" the csv2json command
+ *
+ * @return [int $code, string $stdout, string $stderr]
+ */
+function execCommand(array $args, array $stdin = []): array {
+    $cmd = [PHP_BINARY, 'csv2json', ...$args];
+    $descriptorSpec = [
+        0 => ['pipe', 'r'], //stdin
+        1 => ['pipe', 'w'], //stdout
+        2 => ['pipe', 'w'], //stderr
+    ];
+
+    $process = proc_open($cmd, $descriptorSpec, $pipes, __DIR__);
+
+    // write on process stdin (if any)
+    foreach ($stdin as $line) {
+        fwrite($pipes[0], $line . PHP_EOL);
+    }
+    fclose($pipes[0]);
+
+    // Retrieve stdout and stderr
+    $stdout = trim(stream_get_contents($pipes[1]));
+    fclose($pipes[1]);
+
+    $stderr = trim(stream_get_contents($pipes[2]));
+    fclose($pipes[2]);
+
+    $code = proc_close($process);
+
+    return [$code, $stdout, $stderr];
+}
+
+function assertException(Throwable $exception, callable $assert): void {
+    try {
+        call_user_func($assert);
+    } catch (Throwable $e) {
+        if ('' !== $exception->getMessage() && !preg_match($exception->getMessage(), $e->getMessage())) {
+            throw new Exception(sprintf(
+                'Exception message "%s" doesn\'t matches "%s"',
+                $e->getMessage(),
+                $exception->getMessage(),
+            ));
+        }
+
+        if (0 !== $exception->getCode() && $exception->getCode() !== $e->getCode()) {
+            throw new Exception(sprintf(
+                'Exception code %d doesn\'t match the expected code %d',
+                $e->getCode(),
+                $exception->getCode(),
+            ));
+        }
+
+        // All went well
+        return;
+    }
+
+    throw new Exception(sprintf(
+        'No exception thrown, expected "%s" with code %d and message matches "%s"',
+        get_class($exception),
+        $exception->getCode(),
+        $exception->getMessage(),
+    ));
+}
+
+function assertEqual($expected, $actual): void {
+    if ($expected !== $actual) {
+        throw new Exception(sprintf(
+            'Actual value %s does not equal expected value %s',
+            var_export($actual, true),
+            var_export($expected, true),
+        ));
+    }
+}
+
+function assertMatch(string $regex, string $actual): void {
+    if (!preg_match($regex, $actual)) {
+        throw new Exception(sprintf('Actual value "%s" doesn\'t match pattern "%s"', $actual, $regex));
+    }
+}
+
+function test(string $testName, callable $test, ?callable $dataProvider = null): void {
+    $data = $dataProvider ? call_user_func($dataProvider) : [[]];
+
+    foreach ($data as $dataSetIndex => $dataSet) {
+        try {
+            call_user_func_array($test, $dataSet);
+
+            report(true);
+        } catch (\Throwable $error) {
+            report(false);
+
+            $firstTrace = $error->getTrace()[0];
+            $file = isset($firstTrace['file']) ? basename($firstTrace['file']) : $error->getFile();
+            $line = isset($firstTrace['line']) ? $firstTrace['line'] : $error->getLine();
+
+            $testName .= $dataProvider ? ' with dataset #' . $dataSetIndex : '';
+
+            fwrite(STDOUT, sprintf("✗ Test '%s' failed in %s line %d:\n    %s\n\n",
+                $testName,
+                $file,
+                $line,
+                get_class($error) .' raised: ' . $error->getMessage()
+            ));
+
+            if ($error instanceof ErrorException) {
+                fwrite(STDOUT, $error->getTraceAsString() . PHP_EOL . PHP_EOL);
+            }
+
+            break;
+        }
+    }
+}
+
+function report(?bool $status = null): array {
+    static $report = ['success' => 0, 'failed' => 0];
+
+    if (null !== $status) {
+        $report[$status ? 'success' : 'failed']++;
+    }
+
+    return $report;
+}
+
+function displayReport(): void {
+    $report = report();
+
+    fwrite(STDOUT, "Tests executed: " . ($report['success'] + $report['failed']) . "\n");
+
+    if (0 === $report['failed']) {
+        fwrite(STDOUT, "✓ All tests are OK!\n");
+        exit(0);
+    }
+
+    fwrite(STDOUT, sprintf("✖ Test suite failed: %d SUCCESS, %d FAILED\n", $report['success'], $report['failed']));
+    exit(1);
+}
+
+displayReport();
