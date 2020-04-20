@@ -187,12 +187,6 @@ function assertEqual($expected, $actual): void {
     }
 }
 
-function assertMatch(string $regex, string $actual): void {
-    if (!preg_match($regex, $actual)) {
-        throw new Exception(sprintf('Actual value "%s" doesn\'t match pattern "%s"', $actual, $regex));
-    }
-}
-
 function test(string $testName, callable $test, ?callable $dataProvider = null): void {
     $data = $dataProvider ? call_user_func($dataProvider) : [[]];
 
@@ -220,8 +214,6 @@ function test(string $testName, callable $test, ?callable $dataProvider = null):
             if ($error instanceof ErrorException) {
                 fwrite(STDOUT, $error->getTraceAsString() . PHP_EOL . PHP_EOL);
             }
-
-            break;
         }
     }
 }
