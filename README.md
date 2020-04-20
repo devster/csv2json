@@ -4,7 +4,7 @@
 
 This is an attempt at [Frédéric Bouchery](https://twitter.com/fredbouchery/) exercise: (in french) [https://gist.github.com/f2r/2f1e1fa27186ac670c21d8a0303aabf1](https://gist.github.com/f2r/2f1e1fa27186ac670c21d8a0303aabf1)
 
-*Disclamer: This is very experimental and may contains many pitfalls*
+*Disclaimer: This is very experimental and may contains many pitfalls*
 
 ## Requirements
 
@@ -20,7 +20,7 @@ This is an attempt at [Frédéric Bouchery](https://twitter.com/fredbouchery/) e
 * Read from stdin or file, can be used as a linux pipe `cat file.csv | csv2json --fields ... - | ...`
 * Output (json) on STDOUT
 * Errors on STDERR, different non-zero exit codes based on the error
-* Automatic detection of the CSV separator (Im not totally convinced by the solution, but it should works with most of CSVs :see_no_evil:)
+* Automatic detection of the CSV separator (Im not totally convinced by the solution, but it should works with most of CSVs :see_no_evil: )
 * No memory overhead (peak around 25MB), no matter the csv size, thanks to generators. **Without `--aggregate` option**
 * Can recover ~~pretty well~~ on corrupted lines or format (`--ignore` option)
 * Skip empty lines
