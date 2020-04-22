@@ -14,7 +14,7 @@ This is an attempt at [Frédéric Bouchery](https://twitter.com/fredbouchery/) e
 ## Features and limitations
 
 **Features**
-* Portable (command and unit-tests): tested on Linux and Windows (Not tested on OSX, but it should works :D)
+* Portable (command and unit-tests): tested on Linux, Windows and OSX
 * No tooling, no vendor, only need PHP `7.4+` and `json` extension
 * One file, ~350 LOC
 * Read from stdin or file, can be used as a linux pipe `cat file.csv | csv2json --fields ... - | ...`
