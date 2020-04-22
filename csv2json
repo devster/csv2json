@@ -2,7 +2,7 @@
 <?php
 // Configuration and parameters
 const DEFAULT_CSV_DELIMITER = ",";
-const PROTECTED_DELIMITER_CHARS = ["-", "_", "\"", "'", "\\"];
+const PROTECTED_DELIMITER_CHARS = ["-", "'", "\\"];
 const JSON_ENCODE_OPTIONS = JSON_THROW_ON_ERROR;
 
 // Errors - displayed on stderr
@@ -260,11 +260,15 @@ function filterFields(iterable $lines, string ...$fields): Generator {
 }
 
 /**
- * Try to guess the CSV delimiter in a one line csv string (because we want also use this function for the --fields option)
+ * Try to guess the CSV delimiter in a one line csv string (because we also want use this function for the --fields option)
  * As far as I can see, there is no sure way to detect a delimiter with such little hints
  */
 function getDelimiter(string $str): string {
-    // We gather all unique chars from the string as an array
+    // Remove escaped double quotes to simplify the following
+    $str = str_replace('\"', '', $str);
+    // Remove all chars between double quotes, the ungreedy option is very important here
+    $str = preg_replace('/(".*")/U', '', $str);
+    // We gather all unique remaining chars from the string as an array
     $delimiters = array_unique(str_split($str));
     // Remove some chars protected as non delimiter
     $delimiters = array_filter($delimiters, function (string $delimiter): bool {

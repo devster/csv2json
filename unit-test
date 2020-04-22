@@ -48,12 +48,12 @@ test('e2e full options :)', function () {
 
     [$code, $stdout, $stderr] = execCommand(['--desc', $descFile, '--fields', 'id|name|enabled', '--aggregate', 'age', '--ignore', $csvFile]);
 
+    unlink($csvFile);
+    unlink($descFile);
+
     assertEqual(0, $code);
     assertEqual('{"27":[{"id":1,"name":"john","enabled":null},{"id":2,"name":"jane","enabled":true}]}', $stdout);
     assertEqual('', $stderr);
-
-    unlink($csvFile);
-    unlink($descFile);
 });
 
 test('getDelimiter', function (string $csvLine, string $expectedDelimiter) {
@@ -66,8 +66,10 @@ test('getDelimiter', function (string $csvLine, string $expectedDelimiter) {
     ['id^name,age', '^'],
     ['id^name,age,date', ','],
     ['id|what-is-this-field-uh?|age', '|'], // '-' is protected
-    ['id;",,,";age', ','], // not what we want :(
-    ['id;"here again not what we want";age', ' '], // not what we want :(
+    ['id;",,,";age', ';'],
+    ['id|"hello, \",,"",,"|age', '|'],
+    ['id;"Some spaces more spaces ";age', ';'],
+    ['id;not what we want;age', ' '], // not what we want :(
 ]);
 
 test('createFieldsMapFromDescription', function () {
@@ -202,10 +204,8 @@ function test(string $testName, callable $test, ?callable $dataProvider = null):
             $file = isset($firstTrace['file']) ? basename($firstTrace['file']) : $error->getFile();
             $line = isset($firstTrace['line']) ? $firstTrace['line'] : $error->getLine();
 
-            $testName .= $dataProvider ? ' with dataset #' . $dataSetIndex : '';
-
             fwrite(STDOUT, sprintf("✗ Test '%s' failed in %s line %d:\n    %s\n\n",
-                $testName,
+                $testName . ($dataProvider ? ' with dataset #' . $dataSetIndex : ''),
                 $file,
                 $line,
                 get_class($error) .' raised: ' . $error->getMessage()
